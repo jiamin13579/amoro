@@ -24,22 +24,27 @@ import org.apache.amoro.server.persistence.mapper.TableMetaMapper;
 import org.apache.amoro.server.utils.InternalTableUtil;
 import org.apache.amoro.shade.guava32.com.google.common.base.Preconditions;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.iceberg.LocationProviders;
-import org.apache.iceberg.TableMetadata;
-import org.apache.iceberg.TableMetadataParser;
-import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.*;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.SupportsBulkOperations;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.util.Tasks;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Iceberg table operations {@link TableOperations} */
 public class IcebergInternalTableOperations extends PersistentBase implements TableOperations {
+  private static final Logger LOG = LoggerFactory.getLogger(IcebergInternalTableOperations.class);
 
   private final ServerTableIdentifier identifier;
 
@@ -108,7 +113,51 @@ public class IcebergInternalTableOperations extends PersistentBase implements Ta
     } finally {
       this.tableMetadata = null;
     }
+    deleteRemovedMetadataFiles(base, metadata);
     refresh();
+  }
+
+  /**
+   * Deletes the oldest metadata files if {@link
+   * TableProperties#METADATA_DELETE_AFTER_COMMIT_ENABLED} is true.
+   *
+   * @param base table metadata on which previous versions were based
+   * @param metadata new table metadata with updated previous versions
+   */
+  private void deleteRemovedMetadataFiles(TableMetadata base, TableMetadata metadata) {
+    if (base == null) {
+      return;
+    }
+
+    boolean deleteAfterCommit =
+            metadata.propertyAsBoolean(
+                    TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED,
+                    TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT);
+
+    if (deleteAfterCommit) {
+      Set<TableMetadata.MetadataLogEntry> removedPreviousMetadataFiles =
+              Sets.newHashSet(base.previousFiles());
+      // TableMetadata#addPreviousFile builds up the metadata log and uses
+      // TableProperties.METADATA_PREVIOUS_VERSIONS_MAX to determine how many files should stay in
+      // the log, thus we don't include metadata.previousFiles() for deletion - everything else can
+      // be removed
+      metadata.previousFiles().forEach(removedPreviousMetadataFiles::remove);
+      if (io() instanceof SupportsBulkOperations) {
+        ((SupportsBulkOperations) io())
+                .deleteFiles(
+                        Iterables.transform(
+                                removedPreviousMetadataFiles, TableMetadata.MetadataLogEntry::file));
+      } else {
+        Tasks.foreach(removedPreviousMetadataFiles)
+                .noRetry()
+                .suppressFailureWhenFinished()
+                .onFailure(
+                        (previousMetadataFile, exc) ->
+                                LOG.warn(
+                                        "Delete failed for previous metadata file: {}", previousMetadataFile, exc))
+                .run(previousMetadataFile -> io().deleteFile(previousMetadataFile.file()));
+      }
+    }
   }
 
   @Override
